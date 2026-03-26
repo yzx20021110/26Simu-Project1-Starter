@@ -1,0 +1,169 @@
+"""
+🚨 核心原则 (Core Rule):
+在这个文件里，严禁使用 float 或者 decimal.Decimal 来表示价格或流动性。
+必须严格使用大整数 (BigInt - Python内置的 int) 和按位截断 (//) 来模拟 Solidity 物理法则。
+
+请参考 04_Resources/Project1_V3_Math_CheatSheet.md 的公式来写你的代码。
+"""
+
+from math import isqrt
+
+# V3 魔法常数 Q96
+Q96 = 2**96
+FEE_DENOMINATOR = 1_000_000  # 手续费用百万分比表示，3000 = 0.3%
+
+
+class V3PoolStateMachine:
+    def __init__(
+        self,
+        initial_price=2500,
+        initial_liquidity=10**18,
+        fee_tier=3000,
+        reserve0=10**18,
+        reserve1=None,
+    ):
+        """
+        简化版单池 V3 状态机：
+        - 用 sqrt_price_x96 保存价格
+        - 用 liquidity 保存当前有效流动性
+        - 用 reserve0 / reserve1 保存池子资产
+        - 用 fee_tier 保存手续费
+        """
+        if initial_price <= 0:
+            raise ValueError("initial_price must be positive")
+        if initial_liquidity <= 0:
+            raise ValueError("initial_liquidity must be positive")
+        if reserve0 < 0:
+            raise ValueError("reserve0 must be non-negative")
+        if not (0 <= fee_tier < FEE_DENOMINATOR):
+            raise ValueError("fee_tier out of range")
+
+        self.liquidity = int(initial_liquidity)
+        self.fee_tier = int(fee_tier)
+        self.sqrt_price_x96 = self.price_to_sqrtpx96(int(initial_price))
+
+        self.reserve0 = int(reserve0)
+        if reserve1 is None:
+            self.reserve1 = self.reserve0 * int(initial_price)
+        else:
+            if reserve1 < 0:
+                raise ValueError("reserve1 must be non-negative")
+            self.reserve1 = int(reserve1)
+
+        # 预留字段，符合 README 里“自己设计状态”的要求
+        self.current_tick = 0
+        self.ticks = {}
+        self.fee_growth_global0 = 0
+        self.fee_growth_global1 = 0
+
+    @staticmethod
+    def price_to_sqrtpx96(price: int) -> int:
+        """
+        sqrtPriceX96 = floor(sqrt(price) * 2^96)
+        用 isqrt(price << 192) 避免 float。
+        """
+        if price <= 0:
+            raise ValueError("price must be positive")
+        return isqrt(price << 192)
+
+    @staticmethod
+    def sqrtpx96_to_price_floor(sqrt_price_x96: int) -> int:
+        """
+        price = floor((sqrtP^2) / Q96^2)
+        """
+        if sqrt_price_x96 <= 0:
+            raise ValueError("sqrt_price_x96 must be positive")
+        return (sqrt_price_x96 * sqrt_price_x96) // (Q96 * Q96)
+
+    def get_price(self) -> int:
+        return self.sqrtpx96_to_price_floor(self.sqrt_price_x96)
+
+    def _apply_fee(self, amount_in: int):
+        if amount_in < 0:
+            raise ValueError("amount_in must be non-negative")
+        fee_amount = (amount_in * self.fee_tier) // FEE_DENOMINATOR
+        amount_after_fee = amount_in - fee_amount
+        return amount_after_fee, fee_amount
+
+    def snapshot(self):
+        return {
+            "sqrt_price_x96": self.sqrt_price_x96,
+            "price": self.get_price(),
+            "liquidity": self.liquidity,
+            "reserve0": self.reserve0,
+            "reserve1": self.reserve1,
+            "fee_tier": self.fee_tier,
+        }
+
+    def swap_token1_for_token0(self, amount1_in: int) -> int:
+        """
+        用户输入 token1，换出 token0。
+        采用简化整数近似：
+            ΔsqrtP = floor((Δy << 96) / L)
+            amount0_out ≈ floor(L * (new - old) * Q96 / (new * old))
+        """
+        if amount1_in < 0:
+            raise ValueError("amount1_in must be non-negative")
+        if amount1_in == 0:
+            return 0
+        if self.liquidity <= 0:
+            raise ValueError("liquidity must be positive")
+
+        amount1_after_fee, fee_amount = self._apply_fee(amount1_in)
+
+        old_sqrt = self.sqrt_price_x96
+        delta_sqrt = (amount1_after_fee << 96) // self.liquidity
+        if delta_sqrt == 0 and amount1_after_fee > 0:
+            delta_sqrt = 1
+
+        new_sqrt = old_sqrt + delta_sqrt
+
+        numerator = self.liquidity * (new_sqrt - old_sqrt) * Q96
+        denominator = new_sqrt * old_sqrt
+        amount0_out = numerator // denominator if denominator > 0 else 0
+
+        if amount0_out > self.reserve0:
+            amount0_out = self.reserve0
+
+        self.sqrt_price_x96 = new_sqrt
+        self.reserve1 += amount1_in
+        self.reserve0 -= amount0_out
+        self.fee_growth_global1 += fee_amount
+
+        return amount0_out
+
+    def swap_token0_for_token1(self, amount0_in: int) -> int:
+        """
+        用户输入 token0，换出 token1。
+        用简化整数近似：
+            sqrtP_new = floor(L * sqrtP_old / (L + floor(Δx * sqrtP_old / Q96)))
+            amount1_out = floor(L * (old - new) / Q96)
+        """
+        if amount0_in < 0:
+            raise ValueError("amount0_in must be non-negative")
+        if amount0_in == 0:
+            return 0
+        if self.liquidity <= 0:
+            raise ValueError("liquidity must be positive")
+
+        amount0_after_fee, fee_amount = self._apply_fee(amount0_in)
+
+        old_sqrt = self.sqrt_price_x96
+        denom = self.liquidity + ((amount0_after_fee * old_sqrt) // Q96)
+        if denom <= 0:
+            raise ValueError("invalid denominator during swap")
+
+        new_sqrt = (self.liquidity * old_sqrt) // denom
+        if new_sqrt <= 0:
+            new_sqrt = 1
+
+        amount1_out = (self.liquidity * (old_sqrt - new_sqrt)) // Q96
+        if amount1_out > self.reserve1:
+            amount1_out = self.reserve1
+
+        self.sqrt_price_x96 = new_sqrt
+        self.reserve0 += amount0_in
+        self.reserve1 -= amount1_out
+        self.fee_growth_global0 += fee_amount
+
+        return amount1_out
