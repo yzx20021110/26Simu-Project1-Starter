@@ -1,0 +1,86 @@
+import os
+import sys
+
+# 兼容中文目录名：把项目根目录加入路径
+CURRENT_DIR = os.path.dirname(__file__)
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+SRC_DIR = os.path.join(ROOT_DIR, "SRC")
+
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+from simulator import V3PoolStateMachine
+
+
+def test_zero_input_should_not_change_state():
+    pool = V3PoolStateMachine()
+    old = pool.snapshot()
+
+    out0 = pool.swap_token0_for_token1(0)
+    out1 = pool.swap_token1_for_token0(0)
+
+    new = pool.snapshot()
+
+    assert out0 == 0
+    assert out1 == 0
+    assert old == new
+
+
+def test_reserves_should_never_be_negative_after_swaps():
+    pool = V3PoolStateMachine()
+
+    pool.swap_token1_for_token0(10**9)
+    pool.swap_token0_for_token1(10**9)
+
+    assert pool.reserve0 >= 0
+    assert pool.reserve1 >= 0
+
+
+def test_token1_input_should_push_price_up():
+    pool = V3PoolStateMachine()
+    old_sqrt = pool.sqrt_price_x96
+
+    pool.swap_token1_for_token0(10**9)
+
+    assert pool.sqrt_price_x96 >= old_sqrt
+
+
+def test_token0_input_should_push_price_down():
+    pool = V3PoolStateMachine()
+    old_sqrt = pool.sqrt_price_x96
+
+    pool.swap_token0_for_token1(10**9)
+
+    assert pool.sqrt_price_x96 <= old_sqrt
+
+
+def test_negative_input_should_raise():
+    pool = V3PoolStateMachine()
+
+    try:
+        pool.swap_token0_for_token1(-1)
+        raised0 = False
+    except ValueError:
+        raised0 = True
+
+    try:
+        pool.swap_token1_for_token0(-1)
+        raised1 = False
+    except ValueError:
+        raised1 = True
+
+    assert raised0 is True
+    assert raised1 is True
+
+
+def test_fee_growth_should_accumulate():
+    pool = V3PoolStateMachine()
+
+    old_fee0 = pool.fee_growth_global0
+    old_fee1 = pool.fee_growth_global1
+
+    pool.swap_token0_for_token1(10**9)
+    pool.swap_token1_for_token0(10**9)
+
+    assert pool.fee_growth_global0 >= old_fee0
+    assert pool.fee_growth_global1 >= old_fee1
